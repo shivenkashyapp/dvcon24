@@ -1,24 +1,20 @@
-# Importing the libraries
 import os
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
-import cv2
-import csv
-import pickle
-import numpy as np
+
+import cv2, csv, pickle, numpy as np, matplotlib.pyplot as plt
+
 import tensorflow as tf
 from tensorflow import keras
 from tensorflow.keras import layers
-import tensorflow_addons as tfa
-import matplotlib.pyplot as plt
-from sklearn.metrics import classification_report, confusion_matrix
 from keras.callbacks import ModelCheckpoint
+
+from sklearn.metrics import classification_report, confusion_matrix
 from sklearn.model_selection import train_test_split
 
-# Setting the path for the dataset and model
 path="./ExeImg_Dataset"
 model_path="./Model"
 
-# Defining hyperparameters
+# Hyperparameters
 num_classes = 2
 input_shape = (299, 299, 3)
 learning_rate = 0.001
@@ -26,60 +22,51 @@ weight_decay = 0.0001
 num_epochs = 50
 batch_size = 32
 batch_testsize = 28
-image_size = 128         					# We will resize the input images to this size
-patch_size = 8           					# Size of the patches to be extracted from the input images
+image_size = 128
+patch_size = 8
 num_patches = (image_size // patch_size) ** 2
 projection_dim = 64
-num_heads = 2							# number of attention heads
-transformer_units = [projection_dim * 2, projection_dim,]        # Size of the transformer layers
-transformer_layers = 1						# number of transformer layers
-mlp_head_units = [2048, 1024]                                    # Size of the dense layers of the final classifier
+num_heads = 2
+
+# Size of the transformer layers
+transformer_units = [projection_dim * 2, projection_dim,]        
+
+transformer_layers = 1			
+
+# Size of the dense layers of the final classifier
+mlp_head_units = [2048, 1024]
 key_dim = projection_dim // num_heads
 
-# Creating the datasets
-X = []
-y = []
-Files = ['Benignware', 'Malware']
-label_val = 0
+# Improved tensorflow data pipeline, to avoid loading large C-style arrays into RAM.
+# even though these numpy arrays are optimized, their collective size is enough to cause a RAM insufficiency
+# even on a Kaggle VM, which offers roughly 19 Gigabytes for the latter.
+train_ds, val_ds = image_dataset_from_directory(
+    path,
+    batch_size = batch_size,
+    image_size = input_shape[:2],
+    shuffle = True,
+    validation_split = 0.1,
+    subset = "both",
+    seed = 8,
+    labels = 'inferred'
+)
+Len = lambda *d: sum(i.cardinality().numpy() for i in d)
+tlen = lambda *d: Len(*d) * batch_size
 
-for files in Files:
-    cpath = os.path.join(path, files)
-    for img in os.listdir(cpath):
-        image_array = cv2.imread(os.path.join(cpath, img), cv2.IMREAD_COLOR)
-        X.append(image_array)
-        y.append(label_val)
-    label_val = 1
-
-X = np.asarray(X)
-y = np.asarray(y)
-
-# Set aside 20% for test and the remaining for train and validation sets
-X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle = True, random_state = 8)
-
-# Set aside 10% for validation set and remaining for training set
-X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.1, random_state= 8) 
+test_ds = train_ds.take(floor(0.2 * Len(train_ds)))
 
 # Checking the shape of the datasets
-print(f"X_train: {X_train.shape} - y_train: {y_train.shape}")
-print(f"X_val: {X_val.shape} - y_val: {y_val.shape}")
-print(f"X_test: {X_test.shape} - y_test: {y_test.shape}")
+STEP_SIZE_TRAIN = int(np.ceil(tlen(train_ds) / batch_size))
+STEP_SIZE_VALID = int(np.ceil(tlen(val_ds) / batch_size))
+STEP_SIZE_TEST =  int(np.ceil(tlen(test_ds) / batch_testsize))
 
-# Calculating the steps per epoch
-STEP_SIZE_TRAIN = int( np.ceil(X_train.shape[0] / batch_size) )
-STEP_SIZE_VALID = int( np.ceil(X_val.shape[0] / batch_size) )
-STEP_SIZE_TEST = int( np.ceil(X_test.shape[0] / batch_testsize) )
+adapt_ds = train_ds.map(lambda x, y: x, num_parallel_calls = tf.data.AUTOTUNE)
 
-# Performing Data augmentation
 data_augmentation = keras.Sequential(
-    [
-        layers.Normalization(),
-        layers.Resizing(image_size, image_size),
-    ],
-    name="data_augmentation",
+    [ layers.Normalization(), layers.Resizing(image_size, image_size) ], name="data_augmentation"
 )
 
-# Computing the mean and variance of the training data for normalization.  
-data_augmentation.layers[0].adapt(X_train)
+data_augmentation.layers[0].adapt(adapt_ds)
 
 # Building MLP network
 def mlp(x, hidden_units, dropout_rate):
@@ -188,7 +175,7 @@ def create_vit_classifier():
 
 def run_experiment(model):
     # Compiling the model
-    optimizer = tfa.optimizers.AdamW(
+    optimizer = keras.optimizers.AdamW(
         learning_rate=learning_rate, weight_decay=weight_decay
     )
 
@@ -202,7 +189,7 @@ def run_experiment(model):
     )
 
     # Save the Keras model weights at some frequency (here, when the best validation accuracy is achieved)
-    checkpoint_filepath = "/tmp/checkpoint"
+    checkpoint_filepath = "./checkpoint/model.weights.h5"    # the naming explicitly must end in .weights.h5
     checkpoint_callback = ModelCheckpoint(
         checkpoint_filepath,
         monitor="val_accuracy",
@@ -213,23 +200,22 @@ def run_experiment(model):
 
     # Training the model
     history = model.fit(
-        x=X_train,
-        y=y_train,
-        steps_per_epoch=STEP_SIZE_TRAIN,
-        batch_size=batch_size,
-        epochs=num_epochs,
-        validation_data=(X_val,y_val),
-        validation_steps=STEP_SIZE_VALID,
-        callbacks=[checkpoint_callback],
+        train_ds,
+        steps_per_epoch = STEP_SIZE_TRAIN,
+        batch_size = batch_size,
+        epochs = num_epochs,
+        validation_data = val_ds,
+        validation_steps = STEP_SIZE_VALID,
+        callbacks = [checkpoint_callback],
         shuffle=True
     )
    
-    # Save the model
-    model.save(os.path.join(model_path, "ViT_Model.h5"))
+    # Save the model (saving with h5 does not work anymore.)
+    model.save(os.path.join(model_path, "ViT_Model.keras"), overwrite=True)
     
     # Checking the accuracy
     model.load_weights(checkpoint_filepath)
-    _, accuracy, top_5_accuracy = model.evaluate(X_test, y_test, batch_size=batch_testsize)
+    _, accuracy, top_5_accuracy = model.evaluate(test_ds, batch_size=batch_testsize)
     print(f"Test accuracy: {round(accuracy * 100, 2)}%")
     print(f"Test top 5 accuracy: {round(top_5_accuracy * 100, 2)}%")
     
@@ -253,8 +239,8 @@ def run_experiment(model):
     plt.savefig(os.path.join(model_path, 'Loss.png'))
     
     # Making predictions
-    y_pred=model.predict(X_test, steps=STEP_SIZE_TEST)
-    y_pred=np.argmax(y_pred,axis=1)
+    y_pred = model.predict(test_ds, steps=STEP_SIZE_TEST)
+    y_pred = np.argmax(y_pred,axis=1)
     
     labels = {'Benignware': 0, 'Malware': 1}
     print(f"Labels and their corresponding encodings: {labels}")
@@ -264,10 +250,10 @@ def run_experiment(model):
     print(f"Predictions: {predictions}")
     
     # Get the classification report
-    print(classification_report(y_pred,y_test))
+    # print(classification_report(y_pred,y_test))
     
     # Get the confusion matrix
-    print(confusion_matrix(y_pred,y_test))
+    # print(confusion_matrix(y_pred,y_test))
 
     return history
 
